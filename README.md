@@ -2,7 +2,9 @@
 
 An edge keyword spotting system for the custom wake word "Nexus", running locally on an ESP32 with an INMP441 MEMS microphone. Built with TensorFlow Lite for Microcontrollers, FreeRTOS, and Python Librosa.
 
-![Nexus KWS Breadboard Prototype](docs/images/esp32_breadboard_prototype.jpg)
+<p align="center">
+  <img src="docs/images/esp32_breadboard_prototype.jpg" alt="Nexus KWS Breadboard Prototype" width="550">
+</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue" alt="MCU ESP32">
