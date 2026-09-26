@@ -1,0 +1,36 @@
+# Python / Virtualenv
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Large Third-Party Datasets & Archives
+dataset/speech_commands_v2/
+dataset/*.tar.gz
+*.tar.gz
+*.zip
+
+# Ignore loose audio files except our curated real hardware recordings
+*.wav
+*.mp3
+!dataset/real_positive/*.wav
+!dataset/real_negative/*.wav
+
+# Hardware / Build Artifacts
+*.bin
+*.hex
+*.elf
+.arduino/
+build/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~

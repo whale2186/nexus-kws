@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ESP32 Live Mic</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      background: #0a0a0f;
+      color: #e0e0e0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 30px 20px;
+    }
+    h1 { color: #00e5a0; font-size: 22px; margin-bottom: 6px; }
+    .subtitle { color: #555; font-size: 13px; margin-bottom: 24px; }
+    .controls { display: flex; gap: 12px; margin-bottom: 14px; }
+    button {
+      padding: 10px 28px;
+      font-size: 14px;
+      font-family: inherit;
+      font-weight: bold;
+      cursor: pointer;
+      border-radius: 6px;
+      border: 2px solid #00e5a0;
+      background: transparent;
+      color: #00e5a0;
+      transition: all 0.15s;
+    }
+    button:hover { background: #00e5a0; color: #0a0a0f; }
+    button.active { background: #00e5a0; color: #0a0a0f; }
+    button:disabled { opacity: 0.3; cursor: default; }
+
+    .wifi-section {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      padding: 10px 20px;
+      background: #111118;
+      border: 1px solid #1a1a24;
+      border-radius: 8px;
+    }
+    .wifi-label { color: #888; font-size: 12px; }
+    .wifi-btn {
+      padding: 6px 16px;
+      font-size: 12px;
+      border-width: 1px;
+    }
+    .wifi-btn.on { border-color: #ff6b6b; color: #ff6b6b; }
+    .wifi-btn.on:hover { background: #ff6b6b; color: #0a0a0f; }
+    .wifi-btn.off { border-color: #00e5a0; color: #00e5a0; }
+    .wifi-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      display: inline-block;
+    }
+    .wifi-dot.off { background: #444; }
+    .wifi-dot.connecting { background: #ffaa00; animation: blink 0.6s infinite; }
+    .wifi-dot.on { background: #ff6b6b; }
+    @keyframes blink { 50% { opacity: 0.3; } }
+    #wifi-info { font-size: 12px; color: #888; min-width: 120px; }
+
+    #status {
+      font-size: 13px;
+      color: #666;
+      margin-bottom: 16px;
+      min-height: 18px;
+    }
+    .viz-container {
+      width: 100%;
+      max-width: 800px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .viz-label { color: #555; font-size: 11px; margin-bottom: 2px; }
+    canvas {
+      width: 100%;
+      height: 150px;
+      background: #111118;
+      border-radius: 6px;
+      border: 1px solid #1a1a24;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      width: 100%;
+      max-width: 800px;
+      margin-top: 8px;
+    }
+    .stat {
+      background: #111118;
+      border: 1px solid #1a1a24;
+      border-radius: 6px;
+      padding: 12px;
+      text-align: center;
+    }
+    .stat-val { font-size: 22px; color: #00e5a0; }
+    .stat-label { font-size: 11px; color: #555; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <h1>ESP32 Live Mic</h1>
+  <div class="subtitle">INMP441 → Serial → PC</div>
+
+  <div class="controls">
+    <button id="btnStart" onclick="start()">▶ Start</button>
+    <button id="btnStop" onclick="stop()" disabled>■ Stop</button>
+  </div>
+
+  <div class="wifi-section">
+    <span class="wifi-label">ESP32 WiFi RF</span>
+    <span class="wifi-dot off" id="wifiDot"></span>
+    <span id="wifi-info">OFF</span>
+    <button class="wifi-btn off" id="btnWifiOn" onclick="wifiOn()">📡 Turn ON</button>
+    <button class="wifi-btn on" id="btnWifiOff" onclick="wifiOff()">✕ Turn OFF</button>
+  </div>
+
+  <div id="status">Click Start to begin streaming</div>
+
+  <div class="viz-container">
+    <div>
+      <div class="viz-label">WAVEFORM</div>
+      <canvas id="wave"></canvas>
+    </div>
+    <div>
+      <div class="viz-label">FREQUENCY SPECTRUM</div>
+      <canvas id="spectrum"></canvas>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="stat-val" id="rms">—</div><div class="stat-label">RMS</div></div>
+    <div class="stat"><div class="stat-val" id="peak">—</div><div class="stat-label">PEAK</div></div>
+    <div class="stat"><div class="stat-val" id="samples">—</div><div class="stat-label">SAMPLES/S</div></div>
+    <div class="stat"><div class="stat-val" id="latency">—</div><div class="stat-label">LATENCY</div></div>
+  </div>
+
+<script>
+const RATE = 16000;
+let audioCtx, streaming = false, abortCtrl;
+let sampleCount = 0, sampleTimer = 0;
+
+const waveCanvas = document.getElementById('wave');
+const specCanvas = document.getElementById('spectrum');
+const wCtx = waveCanvas.getContext('2d');
+const sCtx = specCanvas.getContext('2d');
+
+// ── WiFi controls ──────────────────────────────────────────────────────────
+function updateWifiUI(state, ip) {
+  const dot = document.getElementById('wifiDot');
+  const info = document.getElementById('wifi-info');
+  dot.className = 'wifi-dot';
+  if (state === 'OFF' || state === 'WIFI:OFF') {
+    dot.classList.add('off');
+    info.innerText = 'OFF';
+    info.style.color = '#888';
+  } else if (state === 'CONNECTING' || state === 'WIFI:CONNECTING') {
+    dot.classList.add('connecting');
+    info.innerText = 'Connecting...';
+    info.style.color = '#ffaa00';
+  } else if (state.startsWith('WIFI:ON:') || state === 'ON') {
+    dot.classList.add('on');
+    const addr = ip || state.replace('WIFI:ON:', '');
+    info.innerText = 'ON — ' + addr;
+    info.style.color = '#ff6b6b';
+  } else if (state === 'DISCONNECTED' || state === 'WIFI:DISCONNECTED') {
+    dot.classList.add('off');
+    info.innerText = 'Disconnected';
+    info.style.color = '#888';
+  }
+}
+
+async function wifiOn() {
+  await fetch('/wifi', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{"action":"on"}' });
+}
+async function wifiOff() {
+  await fetch('/wifi', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{"action":"off"}' });
+}
+
+// SSE for real-time WiFi status from ESP32
+const evtSource = new EventSource('/events');
+evtSource.onmessage = (e) => updateWifiUI(e.data);
+
+// ── Canvas ─────────────────────────────────────────────────────────────────
+function resizeCanvases() {
+  for (const c of [waveCanvas, specCanvas]) {
+    c.width  = c.clientWidth * devicePixelRatio;
+    c.height = c.clientHeight * devicePixelRatio;
+  }
+}
+window.addEventListener('resize', resizeCanvases);
+resizeCanvases();
+
+function drawWave(int16) {
+  const w = waveCanvas.width, h = waveCanvas.height;
+  wCtx.fillStyle = '#111118';
+  wCtx.fillRect(0, 0, w, h);
+  wCtx.strokeStyle = '#1a1a24';
+  wCtx.lineWidth = 1;
+  wCtx.beginPath();
+  wCtx.moveTo(0, h/2);
+  wCtx.lineTo(w, h/2);
+  wCtx.stroke();
+  wCtx.strokeStyle = '#00e5a0';
+  wCtx.lineWidth = 1.5;
+  wCtx.beginPath();
+  const step = Math.max(1, Math.floor(int16.length / w));
+  for (let x = 0; x < w && x * step < int16.length; x++) {
+    const y = (1.0 - int16[x * step] / 32768.0) * h / 2;
+    x === 0 ? wCtx.moveTo(x, y) : wCtx.lineTo(x, y);
+  }
+  wCtx.stroke();
+}
+
+function drawSpectrum(float32) {
+  const N = Math.min(512, float32.length);
+  const w = specCanvas.width, h = specCanvas.height;
+  const bins = N / 2;
+  const mag = new Float32Array(bins);
+  for (let k = 0; k < bins; k++) {
+    let re = 0, im = 0;
+    for (let n = 0; n < N; n++) {
+      const win = 0.5 * (1 - Math.cos(2 * Math.PI * n / (N - 1)));
+      const angle = -2 * Math.PI * k * n / N;
+      re += float32[n] * win * Math.cos(angle);
+      im += float32[n] * win * Math.sin(angle);
+    }
+    mag[k] = Math.sqrt(re * re + im * im) / N;
+  }
+  const maxMag = Math.max(...mag, 1e-10);
+  sCtx.fillStyle = '#111118';
+  sCtx.fillRect(0, 0, w, h);
+  const barW = w / bins;
+  for (let k = 0; k < bins; k++) {
+    const db = 20 * Math.log10(mag[k] / maxMag + 1e-10);
+    const norm = Math.max(0, 1 + db / 60);
+    const barH = norm * h;
+    const hue = 150 + (k / bins) * 30;
+    sCtx.fillStyle = `hsla(${hue}, 80%, 50%, 0.8)`;
+    sCtx.fillRect(k * barW, h - barH, barW - 1, barH);
+  }
+}
+
+// ── Audio stream ───────────────────────────────────────────────────────────
+async function start() {
+  if (streaming) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RATE });
+  abortCtrl = new AbortController();
+  streaming = true;
+  document.getElementById('btnStart').disabled = true;
+  document.getElementById('btnStop').disabled = false;
+  document.getElementById('status').innerText = 'Connecting...';
+  sampleCount = 0;
+  sampleTimer = performance.now();
+
+  try {
+    const resp = await fetch('/stream', { signal: abortCtrl.signal });
+    const reader = resp.body.getReader();
+    document.getElementById('status').innerText = 'Streaming live audio';
+    let nextTime = audioCtx.currentTime;
+    let leftover = new Uint8Array(0);
+    let lastViz = 0;
+
+    while (streaming) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const combined = new Uint8Array(leftover.length + value.length);
+      combined.set(leftover);
+      combined.set(value, leftover.length);
+      const usable = combined.length - (combined.length % 2);
+      leftover = combined.slice(usable);
+      if (usable === 0) continue;
+
+      const int16 = new Int16Array(combined.buffer, combined.byteOffset, usable / 2);
+      const float32 = new Float32Array(int16.length);
+
+      let sumSq = 0, pk = 0;
+      for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / 32768.0;
+        sumSq += float32[i] * float32[i];
+        const a = Math.abs(int16[i]);
+        if (a > pk) pk = a;
+      }
+
+      sampleCount += int16.length;
+
+      const vizNow = performance.now();
+      if (vizNow - lastViz > 66) {
+        lastViz = vizNow;
+        const rms = Math.sqrt(sumSq / int16.length) * 32768;
+        document.getElementById('rms').innerText = rms.toFixed(0);
+        document.getElementById('peak').innerText = pk;
+        const elapsed = (vizNow - sampleTimer) / 1000;
+        document.getElementById('samples').innerText =
+          elapsed > 0 ? (sampleCount / elapsed).toFixed(0) : '—';
+        const bufSec = int16.length / RATE;
+        document.getElementById('latency').innerText = (bufSec * 1000).toFixed(0) + 'ms';
+        drawWave(int16);
+        drawSpectrum(float32);
+      }
+
+      // Play audio — snap to live if behind by >80ms
+      const buf = audioCtx.createBuffer(1, float32.length, RATE);
+      buf.getChannelData(0).set(float32);
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(audioCtx.destination);
+      const audioNow = audioCtx.currentTime;
+      if (nextTime < audioNow - 0.08) nextTime = audioNow;
+      src.start(nextTime);
+      nextTime += buf.duration;
+    }
+  } catch(e) {
+    if (e.name !== 'AbortError') {
+      document.getElementById('status').innerText = 'Error: ' + e.message;
+      console.error(e);
+    }
+  }
+  streaming = false;
+  document.getElementById('btnStart').disabled = false;
+  document.getElementById('btnStop').disabled = true;
+  document.getElementById('status').innerText = 'Stopped';
+}
+
+function stop() {
+  streaming = false;
+  if (abortCtrl) abortCtrl.abort();
+  if (audioCtx) audioCtx.close();
+}
+</script>
+</body>
+</html>
