@@ -26,9 +26,9 @@ The system is fully implemented and verified on physical hardware across all 6 d
 - **Dual-core audio pipeline:** Audio capture and inference run on separate Xtensa cores. FreeRTOS `audio_task` pinned to Core 0 handles continuous I2S DMA and 13-bin MFCC extraction at 50 Hz, while Core 1 executes neural network inference and network streaming.
 - **ESP-DSP hardware acceleration:** Radix-2 assembly FFT routines (`dsps_fft2r_fc32`) with bit-reversal tables and precomputed Hann windows execute in ~45 µs per frame (down from ~8,200 µs in software float). Total idle chip CPU sits at **7.2% – 7.5%** with Wi-Fi connected (6.3% standalone), strictly satisfying the <10% constraint.
 - **Inference on physical silicon:** A trimmed DS-CNN architecture (1,294 parameters, 10.2 KB INT8 binary) executes in ~120 ms on an ESP32 at 240 MHz.
-- **Phase 6 ASR streaming handoff:** When "Nexus" triggers, the ESP32 transmits a 200 ms circular pre-roll audio buffer and streams live 16 kHz PCM over Wi-Fi TCP to an open-source Vosk speech recognition server (`streaming_asr/asr_server.py`). Measured handoff latency from wake trigger to first audio byte at the server is **44.8 ms** (strictly satisfying the <50 ms target).
+- **Phase 6 ASR streaming handoff:** When "Nexus" triggers, the ESP32 transmits a 200 ms circular pre-roll audio buffer and streams live 16 kHz PCM over Wi-Fi TCP to an open-source Vosk speech recognition server (`streaming_asr/asr_server.py`). Measured socket handoff latency from wake trigger to first audio byte receipt at the server is **44.8 ms** (strictly satisfying the <50 ms target; full sentence transcription follows at ~1.5s).
 - **Single-utterance detection:** "Nexus" activates on the first attempt at normal speaking volume across the room.
-- **Rejection of background noise and confusers:** The dataset incorporates 51 real INMP441 vocal takes of "Nexus", 40 ambient room noise recordings, 20 spoken confusers through the INMP441, and ~3,000 real speech clips from Google Speech Commands v2. False alarm rate is 0.0% on ambient noise and non-wake speech.
+- **Rejection of background noise and confusers:** The dataset incorporates 51 real INMP441 vocal takes of "Nexus", 40 ambient room noise recordings, 20 spoken confusers through the INMP441, and ~3,000 real speech clips from Google Speech Commands v2. Development validation accuracy is 97.90% (85/15 split on augmented training data) with 0.0% false activations during live ambient room noise and non-wake speech testing.
 
 ---
 
@@ -50,19 +50,19 @@ The system is fully implemented and verified on physical hardware across all 6 d
 
 ## Hardware Benchmarks
 
-Measured on the physical ESP32 prototype:
+Measured on the physical ESP32 prototype testbed:
 
-| Metric | Target Constraint | Measured Result | Status |
-| :--- | :--- | :--- | :--- |
-| **Model Size (Flash)** | Lightweight | **10.2 KB** (`model.tflite` INT8) | PASS |
-| **Dynamic RAM Footprint** | < 256 KB | **80 KB** (KWS) / **95 KB** (KWS + Streaming) | PASS |
-| **Idle CPU Overhead** | < 10% | **6.3%** (Standalone) / **7.2% – 7.5%** (Wi-Fi connected) | PASS |
-| **Handoff Latency** | < 50 ms | **44.8 ms** (TCP connect to first byte received) | PASS |
-| **Inference Latency** | Low latency | **~120 ms** per pass on ESP32 @ 240 MHz | PASS |
-| **Validation Accuracy** | High | **97.90%** on held-out test split | PASS |
-| **True Positive Rate** | High | **99.6%** confidence on real vocal "Nexus" takes | PASS |
-| **False Activation Rate** | Near-zero | **0.0%** on Speech Commands v2, ambient noise, and claps | PASS |
-| **Software Stack** | 100% Open Source | ESP-IDF, ESP-DSP, TFLM, Vosk (No proprietary SDKs) | PASS |
+| Metric | Target Constraint | Measured Result | Qualification / Measurement Method | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **Model Size (Flash)** | Lightweight | **10.2 KB** | `model.tflite` INT8 binary (1,294 parameters) | PASS |
+| **Dynamic RAM Footprint** | < 256 KB | **80 KB – 95 KB** | 24 KB static Tensor Arena + FreeRTOS buffers; 225+ KB heap free | PASS |
+| **Idle CPU Overhead** | < 10% | **7.2% – 7.5%** | ESP-DSP assembly FFT at 50 Hz; Core 0: 14.5%, Core 1: 0.0% | PASS |
+| **Socket Handoff Latency** | < 50 ms | **44.8 ms** | Time delta from edge wake event to host TCP audio ingest | PASS |
+| **ASR Transcription** | End-to-end | **~1.5 – 2.0 s** | Full utterance recognition latency via streaming Vosk | PASS |
+| **Inference Latency** | Low latency | **~120 ms** | Microsecond cycle execution for TFLM `Invoke()` on Core 1 | PASS |
+| **Development Accuracy** | High | **97.90%** | Validation accuracy on augmented dataset (85/15 split) | PASS |
+| **Live False Alarm Rate** | Near-zero | **0.0%** | Zero false triggers during continuous ambient noise testing | PASS |
+| **Software Stack** | 100% Open Source | **Fully open-source** | ESP-IDF, ESP-DSP, TFLM, Vosk (No proprietary SDKs) | PASS |
 
 ---
 
