@@ -7,12 +7,12 @@ Improvements over v3:
 2. Loads Google Speech Commands v2 as real human negative samples
 3. Keeps synthetic positives + hard negatives from v3
 4. Better class balancing with real data priority
-5. Exports model.h, mfcc_norm.h to nexus_kws/ for direct flashing
+5. Exports model.h, mfcc_norm.h to firmware/nexus_kws/ for direct flashing
 
 Run:
     python3 scripts/download_speech_commands.py   # Once (downloads ~2.3GB)
     python3 scripts/record_wake_word.py           # Record real samples
-    python3 train_kws_v4.py                       # Train and export
+    python3 training/train_kws_v4.py                       # Train and export
 
 Prerequisites:
     pip install numpy soundfile librosa scipy tensorflow
@@ -22,6 +22,8 @@ import os
 import glob
 import json
 import random
+from pathlib import Path
+from features import extract_mfcc
 import numpy as np
 import soundfile as sf
 import librosa
@@ -40,21 +42,24 @@ NUM_MFCC = 13
 NUM_FRAMES = 49
 
 # --- Output Paths ---
-MODEL_TFLITE_PATH = "model.tflite"
-MODEL_H_PATH = "model.h"
-MODEL_H_INO_PATH = "nexus_kws/model.h"
-NORM_JSON_PATH = "mfcc_norm_stats.json"
-NORM_H_PATH = "mfcc_norm.h"
-NORM_H_INO_PATH = "nexus_kws/mfcc_norm.h"
+ROOT = Path(__file__).resolve().parents[1]
+TRAINING_DIR = ROOT / "training"
+FIRMWARE_DIR = ROOT / "firmware/nexus_kws"
+SEED = 42
+
+MODEL_TFLITE_PATH = TRAINING_DIR / "model.tflite"
+MODEL_H_INO_PATH = FIRMWARE_DIR / "model.h"
+NORM_JSON_PATH = TRAINING_DIR / "mfcc_norm_stats.json"
+NORM_H_INO_PATH = FIRMWARE_DIR / "mfcc_norm.h"
 
 # --- Dataset Paths ---
-REAL_POSITIVE_DIR = "dataset/real_positive"
-REAL_NEGATIVE_DIR = "dataset/real_negative"
-SYNTH_POSITIVE_DIR = "dataset/positive"
-NEGATIVE_DIR = "dataset/negative"
-UNKNOWN_DIR = "dataset/unknown"
-NEGATIVES_EXPANDED_DIR = "dataset/negatives_expanded"
-SPEECH_COMMANDS_DIR = "dataset/speech_commands_v2"
+REAL_POSITIVE_DIR = ROOT / "dataset/real_positive"
+REAL_NEGATIVE_DIR = ROOT / "dataset/real_negative"
+SYNTH_POSITIVE_DIR = ROOT / "dataset/positive"
+NEGATIVE_DIR = ROOT / "dataset/negative"
+UNKNOWN_DIR = ROOT / "dataset/unknown"
+NEGATIVES_EXPANDED_DIR = ROOT / "dataset/negatives_expanded"
+SPEECH_COMMANDS_DIR = ROOT / "dataset/speech_commands_v2"
 
 # Hard negative keywords (phonetic confusers)
 HARD_KEYWORDS = [
@@ -73,25 +78,6 @@ SPEECH_COMMANDS_WORDS = [
 ]
 
 
-def extract_mfcc(y):
-    """Extract MFCCs matching firmware pipeline exactly."""
-    if len(y) < AUDIO_LEN:
-        y = np.pad(y, (0, AUDIO_LEN - len(y)), mode='constant')
-    elif len(y) > AUDIO_LEN:
-        y = y[:AUDIO_LEN]
-
-    mfcc = librosa.feature.mfcc(
-        y=y, sr=SR, n_mfcc=NUM_MFCC,
-        n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH,
-        n_mels=N_MELS, center=False
-    )
-    if mfcc.shape[1] < NUM_FRAMES:
-        mfcc = np.pad(mfcc, ((0, 0), (0, NUM_FRAMES - mfcc.shape[1])), mode='constant')
-    else:
-        mfcc = mfcc[:, :NUM_FRAMES]
-    return mfcc.astype(np.float32)
-
-
 def spec_augment(mfcc, max_time_mask=6, max_freq_mask=2):
     augmented = mfcc.copy()
     if max_freq_mask > 0:
@@ -107,7 +93,7 @@ def spec_augment(mfcc, max_time_mask=6, max_freq_mask=2):
 
 def load_ambient_noises():
     noises = []
-    for f in sorted(glob.glob("baseline*.wav")):
+    for f in sorted(glob.glob(str(ROOT / "baseline*.wav"))):
         try:
             y, _ = librosa.load(f, sr=SR)
             noises.append(y)
@@ -213,7 +199,7 @@ def load_real_positives(noises, augments_per_file=60):
 def load_synthetic_positives(noises, augments_per_file=30):
     """Load synthetic TTS 'Nexus' samples."""
     features = []
-    pos_files = glob.glob(os.path.join(SYNTH_POSITIVE_DIR, "*.wav"))
+    pos_files = sorted(glob.glob(os.path.join(SYNTH_POSITIVE_DIR, "*.wav")) + glob.glob(os.path.join(SYNTH_POSITIVE_DIR, "*.mp3")))
     if not pos_files:
         print("No synthetic positive samples found in dataset/positive/")
         return features
@@ -254,14 +240,16 @@ def load_tts_negatives(noises, hard_augments=20, general_augments=4):
     features = []
     speech_files = (
         glob.glob(os.path.join(NEGATIVE_DIR, "*.wav")) +
+        glob.glob(os.path.join(NEGATIVE_DIR, "*.mp3")) +
         glob.glob(os.path.join(UNKNOWN_DIR, "*.wav")) +
+        glob.glob(os.path.join(UNKNOWN_DIR, "*.mp3")) +
         glob.glob(os.path.join(NEGATIVES_EXPANDED_DIR, "*.mp3"))
     )
     hard_count = general_count = 0
 
     print(f"Loading {len(speech_files)} TTS negative files (Hard: {hard_augments}x, General: {general_augments}x)...")
 
-    for filepath in speech_files:
+    for filepath in sorted(speech_files):
         try:
             is_hard = is_hard_negative(filepath)
             n_aug = hard_augments if is_hard else general_augments
@@ -318,7 +306,7 @@ def load_speech_commands_negatives(noises, samples_per_word=80):
 
     for word in available_words:
         word_dir = os.path.join(SPEECH_COMMANDS_DIR, word)
-        wav_files = glob.glob(os.path.join(word_dir, "*.wav"))
+        wav_files = sorted(glob.glob(os.path.join(word_dir, "*.wav")))
         selected = random.sample(wav_files, min(samples_per_word, len(wav_files)))
 
         for filepath in selected:
@@ -357,7 +345,7 @@ def load_real_negatives(noises, speech_augments=35, ambient_augments=25):
 
     speech_files = sorted(glob.glob(os.path.join(REAL_NEGATIVE_DIR, "speech_neg_*.wav")))
     ambient_files = sorted(glob.glob(os.path.join(REAL_NEGATIVE_DIR, "ambient_real_*.wav")))
-    all_other = [f for f in glob.glob(os.path.join(REAL_NEGATIVE_DIR, "*.wav")) if f not in speech_files and f not in ambient_files]
+    all_other = sorted(f for f in glob.glob(os.path.join(REAL_NEGATIVE_DIR, "*.wav")) if f not in speech_files and f not in ambient_files)
 
     print(f"Loading REAL INMP441 negatives: {len(speech_files)} spoken clips ({speech_augments}x) + {len(ambient_files)} ambient clips ({ambient_augments}x)...")
 
@@ -564,11 +552,11 @@ const unsigned int model_tflite_len = {len(tflite_quant_model)};
 
 #endif // MODEL_H
 """
-    for path in [MODEL_H_PATH, MODEL_H_INO_PATH]:
+    for path in [MODEL_H_INO_PATH]:
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         with open(path, "w") as f:
             f.write(model_h_content)
-    print(f"Saved {MODEL_H_PATH} and {MODEL_H_INO_PATH}.")
+    print(f"Saved {MODEL_H_INO_PATH}.")
 
     # Normalization header
     norm_h_content = f"""// Auto-generated by train_kws_v4.py
@@ -580,11 +568,11 @@ const float mfcc_std[13] = {{{', '.join(f'{x:.4f}f' for x in std_flat)}}};
 
 #endif // MFCC_NORM_H
 """
-    for path in [NORM_H_PATH, NORM_H_INO_PATH]:
+    for path in [NORM_H_INO_PATH]:
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         with open(path, "w") as f:
             f.write(norm_h_content)
-    print(f"Saved {NORM_H_PATH} and {NORM_H_INO_PATH}.")
+    print(f"Saved {NORM_H_INO_PATH}.")
 
     norm_data = {"mean": mean_flat, "std": std_flat}
     with open(NORM_JSON_PATH, "w") as f:
@@ -660,7 +648,7 @@ def verify_model(tflite_model, mean_flat, std_flat, noises):
         test("Real Positive 'Nexus'", y_win)
 
     # Test synthetic positive
-    pos_files = glob.glob(os.path.join(SYNTH_POSITIVE_DIR, "*.wav"))
+    pos_files = sorted(glob.glob(os.path.join(SYNTH_POSITIVE_DIR, "*.wav")) + glob.glob(os.path.join(SYNTH_POSITIVE_DIR, "*.mp3")))
     if pos_files:
         y, _ = librosa.load(pos_files[0], sr=SR)
         yt, _ = librosa.effects.trim(y, top_db=22)
@@ -669,7 +657,7 @@ def verify_model(tflite_model, mean_flat, std_flat, noises):
         test("Synth Positive 'Nexus'", y_win)
 
     # Hard negative
-    tex_files = glob.glob(os.path.join(NEGATIVE_DIR, "*Texas*.wav"))
+    tex_files = sorted(glob.glob(os.path.join(NEGATIVE_DIR, "*Texas*.wav")) + glob.glob(os.path.join(NEGATIVE_DIR, "*Texas*.mp3")))
     if tex_files:
         y, _ = librosa.load(tex_files[0], sr=SR)
         yt, _ = librosa.effects.trim(y, top_db=22)
@@ -681,7 +669,7 @@ def verify_model(tflite_model, mean_flat, std_flat, noises):
     for word in ["yes", "no", "stop"]:
         word_dir = os.path.join(SPEECH_COMMANDS_DIR, word)
         if os.path.isdir(word_dir):
-            wavs = glob.glob(os.path.join(word_dir, "*.wav"))
+            wavs = sorted(glob.glob(os.path.join(word_dir, "*.wav")))
             if wavs:
                 y, _ = librosa.load(wavs[0], sr=SR)
                 y_win = np.zeros(16000, dtype=np.float32)
@@ -694,6 +682,9 @@ def verify_model(tflite_model, mean_flat, std_flat, noises):
 # =============================================
 
 def main():
+    # Seed before augmentation, representative sampling, and model initialization.
+    tf.keras.utils.set_random_seed(SEED)
+    tf.config.experimental.enable_op_determinism()
     print("=" * 60)
     print("Nexus KWS v4 — Real + Synthetic Data Training")
     print("=" * 60)
@@ -710,7 +701,7 @@ def main():
         print("\nERROR: No positive samples found!")
         print("  Need at least synthetic positives in dataset/positive/")
         print("  Ideally also real recordings in dataset/real_positive/")
-        return
+        raise SystemExit(1)
 
     # --- Negatives ---
     f_real_neg = load_real_negatives(noises, speech_augments=35, ambient_augments=25)
@@ -744,24 +735,20 @@ def main():
     print(f"  - Impulse:          {len(f_impulse)}")
     print(f"  - Silence/Ambient:  {len(f_silence)}")
 
-    # --- Normalize ---
-    mean = np.mean(X_all, axis=(0, 2), keepdims=True)
-    std = np.std(X_all, axis=(0, 2), keepdims=True) + 1e-6
-    X_norm = (X_all - mean) / std
+    # This is an augmented-clip development split, not an independent test set.
+    indices = np.random.permutation(len(X_all))
+    split_idx = int(0.85 * len(X_all))
+    train_indices, val_indices = indices[:split_idx], indices[split_idx:]
+    X_train, X_val = X_all[train_indices], X_all[val_indices]
+    y_train, y_val = y_all[train_indices], y_all[val_indices]
 
+    # Fit normalization on training clips only.
+    mean = np.mean(X_train, axis=(0, 2), keepdims=True)
+    std = np.std(X_train, axis=(0, 2), keepdims=True) + 1e-6
+    X_train = (X_train - mean) / std
+    X_val = (X_val - mean) / std
     mean_flat = mean.flatten().tolist()
     std_flat = std.flatten().tolist()
-
-    # --- Shuffle and split ---
-    indices = np.arange(len(X_norm))
-    np.random.seed(42)
-    np.random.shuffle(indices)
-    X_norm = X_norm[indices]
-    y_all = y_all[indices]
-
-    split_idx = int(0.85 * len(X_norm))
-    X_train, X_val = X_norm[:split_idx], X_norm[split_idx:]
-    y_train, y_val = y_all[:split_idx], y_all[split_idx:]
 
     X_train = X_train[..., np.newaxis]
     X_val = X_val[..., np.newaxis]
@@ -812,9 +799,9 @@ def main():
     print("\n" + "=" * 60)
     print("Training Complete!")
     print(f"  Model:  {MODEL_TFLITE_PATH} ({os.path.getsize(MODEL_TFLITE_PATH)} bytes)")
-    print(f"  Flash:  nexus_kws/model.h + nexus_kws/mfcc_norm.h updated")
-    print(f"  Next:   arduino-cli compile -b esp32:esp32:esp32 nexus_kws/")
-    print(f"          arduino-cli upload -b esp32:esp32:esp32 -p /dev/ttyUSB0 nexus_kws/")
+    print(f"  Flash:  firmware/nexus_kws/model.h + firmware/nexus_kws/mfcc_norm.h updated")
+    print(f"  Next:   arduino-cli compile -b esp32:esp32:esp32 firmware/nexus_kws/")
+    print(f"          arduino-cli upload -b esp32:esp32:esp32 -p /dev/ttyUSB0 firmware/nexus_kws/")
     print("=" * 60)
 
 

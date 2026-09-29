@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Automated ambient noise collector for ESP32 INMP441 microphone."""
 
+from pathlib import Path
 import os
 import sys
 import time
@@ -9,7 +10,7 @@ import serial
 
 PORT = "/dev/ttyUSB0"
 BAUD = 921600
-OUT_DIR = "dataset/real_negative"
+OUT_DIR = str(Path(__file__).resolve().parents[1] / "dataset/real_negative")
 SAMPLE_RATE = 16000
 SAMPLE_COUNT = 40
 DURATION_S = 1.5

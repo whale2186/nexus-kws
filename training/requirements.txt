@@ -1,3 +1,4 @@
+# Broad dependency ranges; use requirements-lock.txt for the tested Python 3.12 environment.
 tensorflow>=2.15.0
 librosa>=0.10.1
 soundfile>=0.12.1

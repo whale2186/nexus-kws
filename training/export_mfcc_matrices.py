@@ -1,3 +1,4 @@
+from pathlib import Path
 import librosa
 import numpy as np
 import scipy.fftpack
@@ -38,5 +39,5 @@ const float dct_basis[N_MFCC][N_MELS] = {format_2d(dct_basis)};
 #endif
 """
 
-with open("mfcc_coeffs.h", "w") as f:
+with open(Path(__file__).resolve().parents[1] / "firmware/nexus_kws/mfcc_coeffs.h", "w") as f:
     f.write(header)

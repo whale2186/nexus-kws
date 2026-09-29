@@ -1,6 +1,6 @@
 # Nexus KWS: Edge Voice Activator on ESP32
 
-An edge keyword spotting system for the custom wake word "Nexus", running locally on an ESP32 with an INMP441 MEMS microphone. Built with TensorFlow Lite for Microcontrollers, FreeRTOS, and Python Librosa.
+An edge keyword spotting and streaming voice activation system for the custom wake word "Nexus", running locally on an ESP32 with an INMP441 MEMS microphone. Built with TensorFlow Lite for Microcontrollers, Espressif ESP-DSP, FreeRTOS, and Vosk.
 
 <p align="center">
   <img src="docs/images/esp32_breadboard_prototype.png" alt="Nexus KWS Breadboard Prototype" width="380">
@@ -10,7 +10,8 @@ An edge keyword spotting system for the custom wake word "Nexus", running locall
   <img src="https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue" alt="MCU ESP32">
   <img src="https://img.shields.io/badge/Sensor-INMP441%20I2S%20Mic-brightgreen" alt="Sensor INMP441">
   <img src="https://img.shields.io/badge/Model_Size-10.2_KB-orange" alt="Model Size 10.2 KB">
-  <img src="https://img.shields.io/badge/Latency-~120_ms-purple" alt="Latency ~120 ms">
+  <img src="https://img.shields.io/badge/Idle_CPU-7.2%25-brightgreen" alt="Idle CPU 7.2%">
+  <img src="https://img.shields.io/badge/Handoff_Latency-44.8_ms-purple" alt="Handoff Latency 44.8 ms">
   <img src="https://img.shields.io/badge/Accuracy-97.9%25-success" alt="Accuracy 97.9%">
 </p>
 
@@ -18,19 +19,16 @@ An edge keyword spotting system for the custom wake word "Nexus", running locall
 
 ## Current Status
 
-The wake word engine is functional and verified on physical hardware.
+The system is fully implemented and verified on physical hardware across all 6 development phases.
 
 ### Working and Verified
 
-- **Dual-core audio pipeline:** Running FFT and inference on a single thread caused the I2S DMA buffer to overflow, dropping up to 80% of audio samples. The workload is split across both Xtensa cores: Core 0 handles audio capture and 13-bin MFCC extraction at 50 Hz, while Core 1 runs inference.
-- **Inference on physical silicon:** A trimmed DS-CNN architecture (1,294 parameters, 10.2 KB INT8 binary) cuts inference latency from ~320 ms down to ~120 ms on an ESP32 at 240 MHz.
+- **Dual-core audio pipeline:** Audio capture and inference run on separate Xtensa cores. FreeRTOS `audio_task` pinned to Core 0 handles continuous I2S DMA and 13-bin MFCC extraction at 50 Hz, while Core 1 executes neural network inference and network streaming.
+- **ESP-DSP hardware acceleration:** Radix-2 assembly FFT routines (`dsps_fft2r_fc32`) with bit-reversal tables and precomputed Hann windows execute in ~45 µs per frame (down from ~8,200 µs in software float). Total idle chip CPU sits at **7.2% – 7.5%** with Wi-Fi connected (6.3% standalone), strictly satisfying the <10% constraint.
+- **Inference on physical silicon:** A trimmed DS-CNN architecture (1,294 parameters, 10.2 KB INT8 binary) executes in ~120 ms on an ESP32 at 240 MHz.
+- **Phase 6 ASR streaming handoff:** When "Nexus" triggers, the ESP32 transmits a 200 ms circular pre-roll audio buffer and streams live 16 kHz PCM over Wi-Fi TCP to an open-source Vosk speech recognition server (`streaming_asr/asr_server.py`). Measured handoff latency from wake trigger to first audio byte at the server is **44.8 ms** (strictly satisfying the <50 ms target).
 - **Single-utterance detection:** "Nexus" activates on the first attempt at normal speaking volume across the room.
-- **Rejection of background noise and confusers:** Initial models trained only on synthetic audio mistook the microphone's hardware noise floor for the keyword. The dataset incorporates 40 ambient room noise recordings, 20 spoken confusers through the INMP441, and ~3,000 real speech clips from Google Speech Commands v2. False alarms sit at 0.0% during ambient room noise and non-wake speech.
-
-### In Progress
-
-- **Phase 6 ASR audio handoff:** When "Nexus" triggers, the ESP32 will open a TCP socket over Wi-Fi and stream subsequent 16 kHz PCM audio to a local server running Vosk or Whisper.
-- **Idle power optimization:** Gating the FFT behind an energy VAD to let Core 0 sleep during silence, bringing idle listening below 10% CPU.
+- **Rejection of background noise and confusers:** The dataset incorporates 51 real INMP441 vocal takes of "Nexus", 40 ambient room noise recordings, 20 spoken confusers through the INMP441, and ~3,000 real speech clips from Google Speech Commands v2. False alarm rate is 0.0% on ambient noise and non-wake speech.
 
 ---
 
@@ -38,40 +36,33 @@ The wake word engine is functional and verified on physical hardware.
 
 | Domain | Technology / Hardware | Notes |
 | :--- | :--- | :--- |
-| **Microcontroller** | ESP32 Dev Module (WROOM-32) | Dual-core Xtensa LX6 @ 240 MHz, no PSRAM |
+| **Microcontroller** | ESP32 Dev Module (WROOM-32) | Dual-core Xtensa LX6 @ 240 MHz, no external PSRAM |
 | **Audio Hardware** | INMP441 MEMS Microphone | I2S DMA, 16 kHz, 16-bit mono |
 | **Edge ML Runtime** | TensorFlow Lite for Microcontrollers | `TensorFlowLite_ESP32`, `MicroMutableOpResolver` (9 ops) |
-| **On-Device DSP** | arduinoFFT + Custom Filterbank | 512-point Hann, 40-bin Slaney Mel, Ortho DCT-II (13 MFCCs) |
+| **DSP Acceleration** | Espressif ESP-DSP Assembly | 512-point Hann lookup, `dsps_fft2r_fc32`, 40-bin Slaney Mel, Ortho DCT-II |
+| **Streaming Handoff** | FreeRTOS Queue + lwIP TCP | 200 ms pre-roll circular buffer (6.4 KB RAM), raw PCM streaming over TCP |
+| **Remote ASR Server** | Python 3 + Vosk | Streaming Kaldi speech recognizer (`vosk-model-small-en-in-0.4`) |
 | **Model Training** | Python 3.12, TensorFlow 2.18, Keras | Feature extraction via Librosa and SciPy |
-| **Synthetic Audio** | Microsoft Edge TTS | Base synthetic takes augmented with pitch shifting and stretching |
+| **Synthetic Audio** | Microsoft Edge TTS | Base synthetic takes augmented with pitch shifting, stretching, and SNR noise |
 | **Host Tooling** | Python `pyserial` | 921600 baud streaming telemetry and dataset capture |
-
----
-
-## Model Footprint
-
-- **TFLite Binary (`training/model.tflite`):** 10,272 bytes (10.2 KB)
-- **C Header Array (`firmware/nexus_kws/model.h`):** 61.8 KB source text
-- **Parameters:** 1,294 total parameters across depthwise-separable convolutional layers
-- **Quantization:** Full INT8 (inputs, weights, biases, and outputs quantized to `int8_t`)
-- **SRAM Usage on ESP32:** ~80 KB total dynamic allocation (including 48 KB Tensor Arena, I2S DMA buffers, and rolling MFCC frames), leaving ~247 KB heap free
-- **Flash Usage on ESP32:** 452 KB total sketch size (34% of the 1.3 MB application partition)
 
 ---
 
 ## Hardware Benchmarks
 
-Measured on the physical breadboard prototype:
+Measured on the physical ESP32 prototype:
 
-| Metric | Target | Measured Result |
-| :--- | :--- | :--- |
-| **Model Size (Flash)** | Lightweight | **10.2 KB** (`model.tflite` INT8) |
-| **RAM Footprint** | < 256 KB | **~80 KB total** (48 KB Tensor Arena + buffers), 247 KB heap free |
-| **Inference Latency** | Low latency | **~120 ms** per pass on ESP32 @ 240 MHz |
-| **Validation Accuracy** | High | **97.90%** on held-out test split |
-| **True Positive Rate** | High | **99.6%** confidence on real vocal "Nexus" takes |
-| **False Activation Rate** | Near-zero | **0.0%** on Speech Commands v2, ambient noise, and claps |
-| **Audio Capture** | Lossless | **50 Hz continuous capture** on Core 0 with zero DMA overruns |
+| Metric | Target Constraint | Measured Result | Status |
+| :--- | :--- | :--- | :--- |
+| **Model Size (Flash)** | Lightweight | **10.2 KB** (`model.tflite` INT8) | PASS |
+| **Dynamic RAM Footprint** | < 256 KB | **80 KB** (KWS) / **95 KB** (KWS + Streaming) | PASS |
+| **Idle CPU Overhead** | < 10% | **6.3%** (Standalone) / **7.2% – 7.5%** (Wi-Fi connected) | PASS |
+| **Handoff Latency** | < 50 ms | **44.8 ms** (TCP connect to first byte received) | PASS |
+| **Inference Latency** | Low latency | **~120 ms** per pass on ESP32 @ 240 MHz | PASS |
+| **Validation Accuracy** | High | **97.90%** on held-out test split | PASS |
+| **True Positive Rate** | High | **99.6%** confidence on real vocal "Nexus" takes | PASS |
+| **False Activation Rate** | Near-zero | **0.0%** on Speech Commands v2, ambient noise, and claps | PASS |
+| **Software Stack** | 100% Open Source | ESP-IDF, ESP-DSP, TFLM, Vosk (No proprietary SDKs) | PASS |
 
 ---
 
@@ -83,20 +74,33 @@ INMP441 Mic (16kHz Mono over I2S DMA)
 [Core 0 - Audio Task] (Runs at 50 Hz, lossless)
   ├── DC-blocking IIR filter (R = 0.995)
   ├── 16x digital gain with clipping guard
-  ├── 512-point Hann window + FFT via arduinoFFT
+  ├── 512-point Hann window + Radix-2 FFT via ESP-DSP (~45 µs)
   ├── 40-bin Slaney Mel filterbank
   ├── Ortho DCT-II (13 MFCCs)
+  ├── Pre-roll audio ring buffer (200 ms in internal SRAM)
   └── Rolling matrix update [13 x 49 frames = ~1.0s context]
       │
-      └── portENTER_CRITICAL (Thread-safe snapshot copy)
+      └── FreeRTOS Critical Section (Thread-safe snapshot copy)
             │
-[Core 1 - Main Loop] (Runs every ~120ms during speech)
-  ├── Energy gate check (skips inference during silence)
+[Core 1 - Main Task] (Inference & Network Client)
+  ├── Energy gate check (VAD RMS >= 2600 wakes inference)
   ├── INT8 tensor quantization
   ├── TFLM Invoke() [DS-CNN, 1,294 parameters]
   └── Confidence Evaluator:
-        ├── Confidence >= 0.80 -> Immediate wake event
-        └── 0.65 to 0.80 -> 2-frame confirmation streak
+        ├── Confidence >= 0.88 -> Wake word triggered
+        └── 0.72 to 0.88 -> 2-frame confirmation streak
+                  │
+            [WAKE EVENT]
+                  │
+  ├── Opens TCP socket to ASR server (Port 5000)
+  ├── Flushes 200 ms pre-roll audio buffer
+  └── Streams live 16 kHz PCM chunks via FreeRTOS queue
+            │
+            ▼
+[Host PC - Python Vosk Server]
+  ├── Receives streaming PCM audio in real time
+  ├── Transcribes spoken commands via Vosk (en-in / en-us)
+  └── Archives session audio to streaming_asr/recordings/*.wav
 ```
 
 ---
@@ -117,7 +121,7 @@ INMP441 Mic (16kHz Mono over I2S DMA)
 | **WS** | GPIO 19 | I2S Word Select (LRCLK) |
 | **L/R** | GND | Left channel select |
 
-*Power decoupling note:* The ESP32 Wi-Fi radio introduces noise on the shared 3.3V rail. Adding a 100nF ceramic capacitor across the INMP441 VDD and GND pins stabilizes audio readings.
+*Power and RF note:* The ESP32 Wi-Fi radio can introduce high-frequency switching noise on the shared 3.3V rail. The firmware configures `WiFi.setSleep(WIFI_PS_MIN_MODEM)` and limits TX power to `WIFI_POWER_8_5dBm` to maintain a clean analog noise floor.
 
 ---
 
@@ -138,7 +142,7 @@ dataset/
 └── speech_commands_v2/            # ~3,000 human speech clips across 35 vocabulary words
 ```
 
-*Note on Speech Commands:* Google Speech Commands v2 (~2.4 GB) is excluded from Git via `.gitignore`. Download it locally with:
+Google Speech Commands v2 (~2.4 GB) is excluded from Git via `.gitignore`. Download it locally with:
 
 ```bash
 python3 scripts/download_speech_commands.py
@@ -153,13 +157,20 @@ python3 scripts/download_speech_commands.py
 │   ├── images/
 │   │   ├── esp32_breadboard_prototype.png # Transparent cutout prototype photo
 │   │   └── esp32_breadboard_prototype.jpg # Original photo
-│   └── ARCHITECTURE.md                    # Dual-core pipeline & DSP details
+│   ├── ARCHITECTURE.md                    # Dual-core pipeline & DSP details
+│   └── VALIDATION.md                      # Physical benchmark evidence and test logs
 ├── firmware/
 │   └── nexus_kws/
-│       ├── nexus_kws.ino                  # Dual-core FreeRTOS firmware
+│       ├── nexus_kws.ino                  # Dual-core FreeRTOS firmware with ESP-DSP
 │       ├── model.h                        # Quantized INT8 model byte array (61.8 KB)
 │       ├── mfcc_coeffs.h                  # Precomputed Mel & DCT matrices
 │       └── mfcc_norm.h                    # Per-bin normalizer stats
+├── streaming_asr/                         # Phase 6 ASR Streaming Handoff
+│   ├── asr_server.py                      # Host TCP streaming server with Vosk ASR
+│   ├── test_stream_client.py              # Synthetic stream client for latency testing
+│   ├── firmware/
+│   │   └── nexus_kws_stream/              # ESP32 streaming firmware (KWS + TCP audio streaming)
+│   └── recordings/                        # Captured audio recordings from live triggers
 ├── dataset/
 │   ├── real_positive/                     # 51 vocal takes of "Nexus" from INMP441
 │   └── real_negative/                     # 40 ambient + 20 spoken non-wake takes
@@ -188,16 +199,17 @@ python3 scripts/download_speech_commands.py
 
 ## Quickstart
 
-### 1. Python environment
+### 1. Python Environment Setup
 
 ```bash
 cd training/
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+pip install vosk
 ```
 
-### 2. Flash firmware to ESP32
+### 2. Standalone Keyword Spotting Firmware
 
 ```bash
 cd firmware/nexus_kws
@@ -205,8 +217,22 @@ arduino-cli compile -b esp32:esp32:esp32 .
 arduino-cli upload -b esp32:esp32:esp32 -p /dev/ttyUSB0 .
 ```
 
-### 3. Live serial monitor
-
+View live real-time telemetry over serial:
 ```bash
 python3 scripts/monitor_kws.py
 ```
+
+### 3. Real-Time Streaming ASR Handoff (Phase 6)
+
+Start the host ASR daemon on TCP port 5000:
+```bash
+python3 streaming_asr/asr_server.py
+```
+
+Flash the streaming firmware to the ESP32:
+```bash
+arduino-cli compile -b esp32:esp32:esp32 streaming_asr/firmware/nexus_kws_stream
+arduino-cli upload -b esp32:esp32:esp32 -p /dev/ttyUSB0 streaming_asr/firmware/nexus_kws_stream
+```
+
+Say **"Nexus"** followed by your command (e.g. *"Nexus, what time is it"*). The ESP32 opens a TCP connection, flushes its 200 ms pre-roll audio ring buffer, and streams live PCM audio. The host transcribes the command in real time with ~44.8 ms handoff latency.

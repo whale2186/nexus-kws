@@ -7,6 +7,7 @@ Downloads ~2.3GB, extracts to dataset/speech_commands_v2/
 Only needs to run once.
 """
 
+from pathlib import Path
 import os
 import sys
 import tarfile
@@ -14,8 +15,8 @@ import urllib.request
 import hashlib
 
 DATASET_URL = "https://storage.googleapis.com/download.tensorflow.org/data/speech_commands_v0.02.tar.gz"
-DATASET_DIR = "dataset/speech_commands_v2"
-ARCHIVE_PATH = "dataset/speech_commands_v0.02.tar.gz"
+DATASET_DIR = str(Path(__file__).resolve().parents[1] / "dataset/speech_commands_v2")
+ARCHIVE_PATH = str(Path(__file__).resolve().parents[1] / "dataset/speech_commands_v0.02.tar.gz")
 EXPECTED_MD5 = "6b74f3901214cb2c2934e98196829835"
 
 
@@ -77,7 +78,7 @@ def extract_archive(archive, dest):
         members = tar.getmembers()
         total = len(members)
         for i, member in enumerate(members):
-            tar.extract(member, dest)
+            tar.extract(member, dest, filter="data")
             if i % 5000 == 0:
                 print(f"  Extracted {i}/{total} files...")
     print(f"  Done! {total} files extracted.")
@@ -98,14 +99,11 @@ def print_summary(dest):
 
 
 def main():
-    # Check if already downloaded
-    if os.path.isdir(DATASET_DIR):
-        categories = [d for d in os.listdir(DATASET_DIR) if os.path.isdir(os.path.join(DATASET_DIR, d))]
-        if len(categories) > 20:
-            print(f"Dataset already exists at {DATASET_DIR}/ ({len(categories)} categories)")
-            print_summary(DATASET_DIR)
-            print("\nTo re-download, delete the directory first.")
-            return
+    # Only a completed, checksum-verified extraction can be reused.
+    marker = Path(DATASET_DIR) / ".complete-md5"
+    if marker.is_file() and marker.read_text().strip() == EXPECTED_MD5:
+        print_summary(DATASET_DIR)
+        return
 
     # Download
     if os.path.exists(ARCHIVE_PATH):
@@ -114,20 +112,22 @@ def main():
         download_with_progress(DATASET_URL, ARCHIVE_PATH)
 
     # Verify
-    verify_md5(ARCHIVE_PATH, EXPECTED_MD5)
+    if not verify_md5(ARCHIVE_PATH, EXPECTED_MD5):
+        raise SystemExit("Checksum mismatch; remove the archive and retry. Nothing extracted.")
 
     # Extract
     extract_archive(ARCHIVE_PATH, DATASET_DIR)
 
     # Summary
     print_summary(DATASET_DIR)
+    marker.write_text(EXPECTED_MD5 + "\n")
 
     # Cleanup archive
     if os.path.exists(ARCHIVE_PATH):
         os.remove(ARCHIVE_PATH)
         print("Archive removed after extraction to preserve disk space.")
 
-    print("\nReady for training! Run: python3 train_kws_v4.py")
+    print("\nReady for training! Run: python3 training/train_kws_v4.py")
 
 
 if __name__ == "__main__":

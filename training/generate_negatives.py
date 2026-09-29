@@ -1,3 +1,4 @@
+from pathlib import Path
 import asyncio
 import os
 import edge_tts
@@ -33,7 +34,7 @@ VOICES = [
     "en-IN-NeerjaNeural"
 ]
 
-OUT_DIR = "dataset/negatives_expanded"
+OUT_DIR = str(Path(__file__).resolve().parents[1] / "dataset/negatives_expanded")
 
 async def generate(word, voice, path):
     try:

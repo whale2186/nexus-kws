@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <driver/i2s.h>
-#include "arduinoFFT.h"
+#include "esp_dsp.h"
 #include "model.h"
 #include "mfcc_coeffs.h"
 #include "mfcc_norm.h"
@@ -21,11 +21,11 @@
 #define PIN_MIC_WS 19
 #define NUM_FRAMES 49 
 #define DIGITAL_GAIN 16.0f
-#define VAD_THRESHOLD 450  // Gate ambient noise (~200-350 RMS), speech is ~800-3500 RMS
+#define VAD_THRESHOLD 1800 // Gate ambient noise (~800-1400 RMS), speech is ~3500-15000 RMS
 
 // --- TFLITE CONFIG ---
 constexpr int kTensorArenaSize = 48 * 1024;
-uint8_t tensor_arena[kTensorArenaSize];
+alignas(16) uint8_t tensor_arena[kTensorArenaSize];
 const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input_tensor = nullptr;
@@ -33,12 +33,11 @@ TfLiteTensor* output_tensor = nullptr;
 
 // --- MFCC PIPELINE ---
 float audio_frame[N_FFT];     // 512 points for FFT
-float vReal[N_FFT];
-float vImag[N_FFT];
+float hann_window[N_FFT];     // Precomputed periodic Hann window
+float fft_buffer[2 * N_FFT];  // Interleaved complex buffer [Re0, Im0, Re1, Im1, ...]
+float power_spectrum[N_FFT / 2 + 1]; // Power spectrum (|X[k]|^2)
 float mel_energies[N_MELS];
 float mfcc_matrix[N_MFCC][NUM_FRAMES]; // Shared Shape: (13, 49)
-
-ArduinoFFT<float> FFT = ArduinoFFT<float>(vReal, vImag, N_FFT, SAMPLE_RATE);
 
 // Rolling variables
 float dc_x1 = 0, dc_y1 = 0;
@@ -151,32 +150,37 @@ void compute_mfcc(int16_t* new_samples, int hop_size) {
         audio_frame[win - hop + i] = (float)new_samples[i] / 32768.0f;
     }
 
-    // 3. FFT Prepare (Apply 512-point Hann Window)
+    // 3. FFT Prepare (Apply precomputed periodic Hann window into complex interleaved buffer)
     for (int i = 0; i < win; i++) {
-        float multiplier = 0.5f * (1.0f - cos(2.0f * PI * i / 512.0f));
-        vReal[i] = audio_frame[i] * multiplier;
-        vImag[i] = 0.0f;
+        fft_buffer[2 * i] = audio_frame[i] * hann_window[i];
+        fft_buffer[2 * i + 1] = 0.0f;
     }
 
-    // 4. Compute FFT & Power Spectrum
-    FFT.windowing(FFTWindow::Rectangle, FFTDirection::Forward);
-    FFT.compute(FFTDirection::Forward);
-    FFT.complexToMagnitude(); 
+    // 4. Hardware-accelerated Radix-2 FFT via ESP-DSP (Xtensa assembly)
+    dsps_fft2r_fc32(fft_buffer, N_FFT);
+    dsps_bit_rev2r_fc32(fft_buffer, N_FFT);
 
-    // 5. Mel Filterbank Integration
+    // 5. Compute Power Spectrum (|X[k]|^2 = Re^2 + Im^2) for positive frequencies (257 bins)
+    for (int k = 0; k < (N_FFT / 2 + 1); k++) {
+        float r = fft_buffer[2 * k];
+        float im = fft_buffer[2 * k + 1];
+        power_spectrum[k] = r * r + im * im;
+    }
+
+    // 6. Mel Filterbank Integration
     for (int m = 0; m < N_MELS; m++) {
-        mel_energies[m] = 0.0f;
-        for (int k = 0; k < (N_FFT/2 + 1); k++) {
+        float energy = 0.0f;
+        for (int k = 0; k < (N_FFT / 2 + 1); k++) {
             float w = mel_basis[m][k];
             if (w > 0.0f) {
-                mel_energies[m] += w * (vReal[k] * vReal[k]);
+                energy += w * power_spectrum[k];
             }
         }
-        if (mel_energies[m] < 1e-10f) mel_energies[m] = 1e-10f;
-        mel_energies[m] = 10.0f * log10f(mel_energies[m]);
+        if (energy < 1e-10f) energy = 1e-10f;
+        mel_energies[m] = 10.0f * log10f(energy);
     }
 
-    // 6. DCT (Matrix Multiply) to get 13 MFCCs, Normalize & Shift
+    // 7. DCT (Matrix Multiply) to get 13 MFCCs, Normalize & Shift
     float current_frame_mfcc[N_MFCC];
     for (int c = 0; c < N_MFCC; c++) {
         float sum = 0.0f;
@@ -186,7 +190,7 @@ void compute_mfcc(int16_t* new_samples, int hop_size) {
         current_frame_mfcc[c] = (sum - mfcc_mean[c]) / mfcc_std[c];
     }
 
-    // 7. Atomic update of rolling matrix
+    // 8. Atomic update of rolling matrix
     portENTER_CRITICAL(&matrix_mux);
     for (int c = 0; c < N_MFCC; c++) {
         for (int f = 0; f < NUM_FRAMES - 1; f++) {
@@ -199,7 +203,7 @@ void compute_mfcc(int16_t* new_samples, int hop_size) {
     portEXIT_CRITICAL(&matrix_mux);
 }
 
-// Audio Task pinned to Core 0: continuous I2S capture + MFCC extraction (Zero frame drops)
+// Audio Task pinned to Core 0: continuous I2S capture + MFCC extraction
 void audio_task(void* pvParameters) {
     int32_t raw32[640];
     int16_t pcm[320];
@@ -230,13 +234,15 @@ void audio_task(void* pvParameters) {
                 memcpy(&record_buffer[record_samples_collected], pcm, sizeof(pcm));
                 record_samples_collected += 320;
                 if (record_samples_collected >= record_target_samples) {
-                    recording_mode = false;
                     record_done = true;
+                    recording_mode = false;
                 }
             } else {
                 compute_mfcc(pcm, 320);
             }
             core0_active_us += (micros() - t_c0);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5));
         }
     }
 }
@@ -246,6 +252,11 @@ void check_serial_commands() {
         String cmd = Serial.readStringUntil('\n');
         cmd.trim();
         if (cmd.startsWith("REC:")) {
+            // Do not free a buffer still owned by the audio task or awaiting dump.
+            if (recording_mode || record_done) {
+                Serial.println("ERR:BUSY");
+                return;
+            }
             int duration_ms = cmd.substring(4).toInt();
             if (duration_ms <= 0) duration_ms = 1500;
             if (duration_ms > 4000) duration_ms = 4000;
@@ -270,6 +281,7 @@ void check_serial_commands() {
 }
 
 void setup() {
+    WiFi.mode(WIFI_OFF);
     Serial.setTxBufferSize(4096);
     Serial.setRxBufferSize(1024);
     Serial.begin(921600);
@@ -277,6 +289,15 @@ void setup() {
     Serial.println("Initialzing Dual-Core Real-Time KWS System...");
     setup_tflite();
     setup_i2s();
+
+    // Initialize ESP-DSP FFT tables & precompute periodic Hann window
+    esp_err_t dsp_err = dsps_fft2r_init_fc32(NULL, N_FFT);
+    if (dsp_err != ESP_OK) {
+        Serial.printf("ESP-DSP FFT init failed: %d\n", dsp_err);
+    }
+    for (int i = 0; i < N_FFT; i++) {
+        hann_window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (float)N_FFT));
+    }
 
     // Start Audio Acquisition Task on Core 0
     xTaskCreatePinnedToCore(
@@ -290,7 +311,7 @@ void setup() {
     );
 
     Serial.println("System Ready. Listening for Wake Word!");
-    Serial.println("Commands: REC:<seconds>  -- record raw PCM to serial");
+    Serial.println("Commands: REC:<milliseconds>  -- record raw PCM to serial");
 }
 
 void loop() {
@@ -318,6 +339,24 @@ void loop() {
         return;
     }
 
+    // Periodic CPU telemetry (reported every second regardless of idle/active state)
+    if (millis() - last_cpu_report_ms >= 1000) {
+        uint32_t now = millis();
+        uint32_t elapsed_us = (now - last_cpu_report_ms) * 1000;
+        last_cpu_report_ms = now;
+
+        float cpu0 = (core0_active_us * 100.0f) / elapsed_us;
+        float cpu1 = (core1_active_us * 100.0f) / elapsed_us;
+        core0_active_us = 0;
+        core1_active_us = 0;
+        if (cpu0 > 100.0f) cpu0 = 100.0f;
+        if (cpu1 > 100.0f) cpu1 = 100.0f;
+        float total_cpu = (cpu0 + cpu1) / 2.0f;
+
+        Serial.printf("[CPU REPORT] Core 0 (Audio): %.1f%% | Core 1 (ML/App): %.1f%% | Combined: %.1f%%\n",
+                      cpu0, cpu1, total_cpu);
+    }
+
     // Cooldown check
     if (millis() < cooldown_until) {
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -335,31 +374,13 @@ void loop() {
     float rms = latest_rms;
     if (rms < VAD_THRESHOLD) {
         trigger_streak = 0;
-        static int idle_counter = 0;
-        if (++idle_counter >= 50) {
-            idle_counter = 0;
+        static uint32_t last_idle_print_ms = 0;
+        if (millis() - last_idle_print_ms >= 1000) {
+            last_idle_print_ms = millis();
             Serial.printf("[IDLE] RMS: %.0f (VAD Gate: %d)\n", rms, VAD_THRESHOLD);
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        delay(20);
         return;
-    }
-
-    // Check CPU periodic report (once per second)
-    if (millis() - last_cpu_report_ms >= 1000) {
-        uint32_t now = millis();
-        uint32_t elapsed_us = (now - last_cpu_report_ms) * 1000;
-        last_cpu_report_ms = now;
-
-        float cpu0 = (core0_active_us * 100.0f) / elapsed_us;
-        float cpu1 = (core1_active_us * 100.0f) / elapsed_us;
-        core0_active_us = 0;
-        core1_active_us = 0;
-        if (cpu0 > 100.0f) cpu0 = 100.0f;
-        if (cpu1 > 100.0f) cpu1 = 100.0f;
-        float total_cpu = (cpu0 + cpu1) / 2.0f;
-
-        Serial.printf("[CPU REPORT] Core 0 (Audio): %.1f%% | Core 1 (ML/App): %.1f%% | Combined: %.1f%%\n",
-                      cpu0, cpu1, total_cpu);
     }
 
     // Only run inference if at least 2 new audio hops (40ms) entered the rolling matrix

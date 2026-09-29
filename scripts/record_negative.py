@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Interactive speech negatives collector for ESP32 INMP441 microphone."""
 
+from pathlib import Path
 import os
 import sys
 import time
@@ -9,7 +10,7 @@ import serial
 
 PORT = "/dev/ttyUSB0"
 BAUD = 921600
-OUT_DIR = "dataset/real_negative"
+OUT_DIR = str(Path(__file__).resolve().parents[1] / "dataset/real_negative")
 SAMPLE_RATE = 16000
 DURATION_S = 1.5
 START_MARKER = b"===AUDIO_START:"

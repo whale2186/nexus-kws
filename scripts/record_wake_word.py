@@ -3,11 +3,11 @@
 record_wake_word.py — Capture real "Nexus" samples from ESP32 INMP441 mic via UART.
 
 Usage:
-    python3 record_wake_word.py                    # Interactive mode, saves to dataset/real_positive/
-    python3 record_wake_word.py --count 50         # Record 50 samples
-    python3 record_wake_word.py --port /dev/ttyACM0 --duration 1.5
+    python3 scripts/record_wake_word.py                    # Interactive mode, saves to dataset/real_positive/
+    python3 scripts/record_wake_word.py --count 50         # Record 50 samples
+    python3 scripts/record_wake_word.py --port /dev/ttyACM0 --duration 1.5
 
-The ESP32 must be running nexus_kws.ino (or serial_audio.ino) firmware.
+The ESP32 must be running firmware/nexus_kws/nexus_kws.ino firmware.
 This script sends "REC:<ms>" over UART, captures the raw PCM response,
 and saves each sample as a 16kHz mono WAV.
 
@@ -19,6 +19,7 @@ Tips for good recordings:
   - Have other people record if possible
 """
 
+from pathlib import Path
 import serial
 import struct
 import wave
@@ -29,7 +30,7 @@ import argparse
 
 
 SAMPLE_RATE = 16000
-OUTPUT_DIR = "dataset/real_positive"
+OUTPUT_DIR = str(Path(__file__).resolve().parents[1] / "dataset/real_positive")
 
 # Markers from nexus_kws.ino UART recording mode
 START_MARKER = b"===AUDIO_START:"
@@ -195,10 +196,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 record_wake_word.py                       # Interactive mode
-  python3 record_wake_word.py --count 50            # Batch 50 samples
-  python3 record_wake_word.py --count 20 --duration 2.0
-  python3 record_wake_word.py --port /dev/ttyACM0
+  python3 scripts/record_wake_word.py                       # Interactive mode
+  python3 scripts/record_wake_word.py --count 50            # Batch 50 samples
+  python3 scripts/record_wake_word.py --count 20 --duration 2.0
+  python3 scripts/record_wake_word.py --port /dev/ttyACM0
         """,
     )
     parser.add_argument("--port", type=str, default=None, help="Serial port (auto-detect if omitted)")
