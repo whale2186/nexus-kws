@@ -236,3 +236,14 @@ arduino-cli upload -b esp32:esp32:esp32 -p /dev/ttyUSB0 streaming_asr/firmware/n
 ```
 
 Say **"Nexus"** followed by your command (e.g. *"Nexus, what time is it"*). The ESP32 opens a TCP connection, flushes its 200 ms pre-roll audio ring buffer, and streams live PCM audio. The host transcribes the command in real time with ~44.8 ms handoff latency.
+
+---
+
+## Research & References
+
+Full literature citations, theoretical foundations, and hardware datasheets are documented in [docs/RESEARCH_AND_REFERENCES.md](docs/RESEARCH_AND_REFERENCES.md):
+- **Architecture**: *Hello Edge: Keyword Spotting on Microcontrollers* (Zhang et al., 2017) — DS-CNN efficiency.
+- **Quantization**: *Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference* (Jacob et al., 2018).
+- **DSP Filterbanks**: *Comparison of parametric representations for monosyllabic word recognition* (Davis & Mermelstein, 1980) & Slaney Auditory Toolbox.
+- **Hardware Acceleration**: Espressif ESP-DSP Assembly Library (`dsps_fft2r_fc32`).
+- **ASR & Datasets**: Google Speech Commands v2 (Warden, 2018) & Vosk Streaming Kaldi ASR.
