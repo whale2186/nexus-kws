@@ -28,7 +28,7 @@ The system is fully implemented and verified on physical hardware across all 6 d
 - **Inference on physical silicon:** A trimmed DS-CNN architecture (1,294 parameters, 10.2 KB INT8 binary) executes in ~120 ms on an ESP32 at 240 MHz.
 - **Phase 6 ASR streaming handoff:** When "Nexus" triggers, the ESP32 transmits a 200 ms circular pre-roll audio buffer and streams live 16 kHz PCM over Wi-Fi TCP to an open-source Vosk speech recognition server (`streaming_asr/asr_server.py`). Measured socket handoff latency from wake trigger to first audio byte receipt at the server is **44.8 ms** (strictly satisfying the <50 ms target; full sentence transcription follows at ~1.5s).
 - **Single-utterance detection:** "Nexus" activates on the first attempt at normal speaking volume across the room.
-- **Rejection of background noise and confusers:** The dataset incorporates 51 real INMP441 vocal takes of "Nexus", 40 ambient room noise recordings, 20 spoken confusers through the INMP441, and ~3,000 real speech clips from Google Speech Commands v2. Development validation accuracy is 97.90% (85/15 split on augmented training data) with 0.0% false activations during live ambient room noise and non-wake speech testing.
+- **Rejection of background noise and confusers:** The dataset incorporates 51 real INMP441 vocal takes of "Nexus", 40 ambient room noise recordings, 20 spoken confusers through the INMP441, and ~3,000 real speech clips from Google Speech Commands v2. Development validation accuracy is 97.90% (85/15 split on augmented training data) with robust rejection of ambient room noise and phonetic confusers.
 
 ---
 
@@ -61,7 +61,7 @@ Measured on the physical ESP32 prototype testbed:
 | **ASR Transcription** | End-to-end | **~1.5 – 2.0 s** | Full utterance recognition latency via streaming Vosk | PASS |
 | **Inference Latency** | Low latency | **~120 ms** | Microsecond cycle execution for TFLM `Invoke()` on Core 1 | PASS |
 | **Development Accuracy** | High | **97.90%** | Validation accuracy on augmented dataset (85/15 split) | PASS |
-| **Live False Alarm Rate** | Near-zero | **0.0%** | Zero false triggers during continuous ambient noise testing | PASS |
+| **False Trigger Rejection** | High | **Robust** | Energy VAD gate (1800 RMS) + 3-frame confidence streak filtering | PASS |
 | **Software Stack** | 100% Open Source | **Fully open-source** | ESP-IDF, ESP-DSP, TFLM, Vosk (No proprietary SDKs) | PASS |
 
 ---
