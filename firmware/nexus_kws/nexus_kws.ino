@@ -21,7 +21,8 @@
 #define PIN_MIC_WS 19
 #define NUM_FRAMES 49 
 #define DIGITAL_GAIN 16.0f
-#define VAD_THRESHOLD 1800 // Gate ambient noise (~800-1400 RMS), speech is ~3500-15000 RMS
+#define VAD_THRESHOLD 1800 // Gate ambient noise (~600-1400 RMS), speech is ~3500-25000 RMS
+#define HOP_SAMPLES   320
 
 // --- TFLITE CONFIG ---
 constexpr int kTensorArenaSize = 48 * 1024;
@@ -63,6 +64,14 @@ volatile bool record_done = false;
 int16_t* record_buffer = nullptr;
 int record_target_samples = 0;
 int record_samples_collected = 0;
+
+// --- ASR STREAMING & PRE-ROLL BUFFER (200ms = 10 hops * 320 samples = 6.4KB) ---
+#define PREROLL_HOPS    10
+#define PREROLL_SAMPLES (PREROLL_HOPS * HOP_SAMPLES)
+int16_t preroll_buffer[PREROLL_SAMPLES];
+volatile int preroll_head = 0;
+volatile bool is_streaming = false;
+QueueHandle_t audio_stream_queue = nullptr;
 
 void setup_tflite() {
     model = tflite::GetModel(model_tflite);
@@ -230,6 +239,17 @@ void audio_task(void* pvParameters) {
             }
             latest_rms = sqrtf(rms / 320.0f);
 
+            // Maintain circular pre-roll buffer (200ms)
+            for (int i = 0; i < 320; i++) {
+                preroll_buffer[(preroll_head + i) % PREROLL_SAMPLES] = pcm[i];
+            }
+            preroll_head = (preroll_head + 320) % PREROLL_SAMPLES;
+
+            // Stream live PCM chunk over audio queue if active
+            if (is_streaming && audio_stream_queue != nullptr) {
+                xQueueSend(audio_stream_queue, pcm, 0);
+            }
+
             if (recording_mode && record_buffer != nullptr) {
                 memcpy(&record_buffer[record_samples_collected], pcm, sizeof(pcm));
                 record_samples_collected += 320;
@@ -280,6 +300,52 @@ void check_serial_commands() {
     }
 }
 
+void stream_to_serial_asr() {
+    uint32_t t_start = millis();
+    Serial.println("\n===WAKE:NEXUS:STREAM_START===");
+
+    // 1. Send 200ms pre-roll in chronological order
+    int head = preroll_head;
+    int16_t temp[320];
+    for (int h = 0; h < PREROLL_HOPS; h++) {
+        int start_idx = (head + h * 320) % PREROLL_SAMPLES;
+        for (int i = 0; i < 320; i++) {
+            temp[i] = preroll_buffer[(start_idx + i) % PREROLL_SAMPLES];
+        }
+        Serial.write((const uint8_t*)temp, sizeof(temp));
+    }
+
+    if (audio_stream_queue != nullptr) {
+        xQueueReset(audio_stream_queue);
+    }
+    is_streaming = true;
+
+    // 2. Stream live audio from queue until silence for >1.2s or max 5.0s
+    int silence_hops = 0;
+    int16_t chunk[320];
+
+    while (millis() - t_start < 5000) {
+        if (xQueueReceive(audio_stream_queue, chunk, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.write((const uint8_t*)chunk, sizeof(chunk));
+
+            if (latest_rms < VAD_THRESHOLD) {
+                silence_hops++;
+            } else {
+                silence_hops = 0;
+            }
+
+            if (silence_hops >= 50) { // 1.0s silence
+                break;
+            }
+        }
+    }
+
+    is_streaming = false;
+    Serial.flush();
+    Serial.println("\n===STREAM_END===");
+    cooldown_until = millis() + 1000;
+}
+
 void setup() {
     WiFi.mode(WIFI_OFF);
     Serial.setTxBufferSize(4096);
@@ -289,6 +355,8 @@ void setup() {
     Serial.println("Initialzing Dual-Core Real-Time KWS System...");
     setup_tflite();
     setup_i2s();
+
+    audio_stream_queue = xQueueCreate(20, 320 * sizeof(int16_t));
 
     // Initialize ESP-DSP FFT tables & precompute periodic Hann window
     esp_err_t dsp_err = dsps_fft2r_init_fc32(NULL, N_FFT);
@@ -428,20 +496,21 @@ void loop() {
     Serial.printf("Prob: %.2f | Streak: %d | RMS: %.0f\n", prob, trigger_streak, rms);
 
     // 5. Detection Trigger:
-    // Instant trigger if confidence is high (>= 0.80)
-    // Or fast 2-inference streak if confidence is >= 0.65
-    if (prob >= 0.80f) {
-        Serial.printf(">>>> WAKE WORD DETECTED! <<<< (Confidence: %.2f | RMS: %.0f)\n", prob, rms);
-        trigger_streak = 0;
-        cooldown_until = millis() + 800; // 800ms cooldown
-    } else if (prob >= 0.65f) {
+    bool triggered = false;
+    if (prob >= 0.85f) {
+        triggered = true;
+    } else if (prob >= 0.70f) {
         trigger_streak++;
-        if (trigger_streak >= 2) {
-            Serial.printf(">>>> WAKE WORD DETECTED! <<<< (Confidence: %.2f | RMS: %.0f)\n", prob, rms);
-            trigger_streak = 0;
-            cooldown_until = millis() + 800;
+        if (trigger_streak >= 3) {
+            triggered = true;
         }
     } else {
         trigger_streak = 0;
+    }
+
+    if (triggered) {
+        Serial.printf("\n>>>> WAKE WORD DETECTED! <<<< (Confidence: %.2f | RMS: %.0f)\n", prob, rms);
+        trigger_streak = 0;
+        stream_to_serial_asr();
     }
 }

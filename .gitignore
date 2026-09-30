@@ -39,3 +39,8 @@ build/
 secrets.h
 **/secrets.h
 streaming_asr/recordings/
+
+# Private Local Playbooks (Local PC Only — Do NOT Push)
+*.private.md
+INTERNAL_*.md
+docs/*.private.md

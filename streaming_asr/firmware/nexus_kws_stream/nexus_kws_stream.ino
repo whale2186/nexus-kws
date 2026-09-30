@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <driver/i2s.h>
+#include <soc/soc.h>
+#include <soc/rtc_cntl_reg.h>
 #include "esp_dsp.h"
 #include "model.h"
 #include "mfcc_coeffs.h"
@@ -21,11 +23,15 @@
 
 #ifndef WIFI_SSID
   #define WIFI_SSID       "YOUR_WIFI_SSID"
+#endif
+#ifndef WIFI_PASS
   #define WIFI_PASS       "YOUR_WIFI_PASSWORD"
 #endif
 
 #ifndef ASR_SERVER_IP
   #define ASR_SERVER_IP   "192.168.1.100"
+#endif
+#ifndef ASR_SERVER_PORT
   #define ASR_SERVER_PORT 5000
 #endif
 
@@ -42,14 +48,19 @@
 #define N_MELS          40
 #define N_MFCC          13
 
+#define STREAM_BATCH_HOPS 4
+#define STREAM_BATCH_SAMPLES (STREAM_BATCH_HOPS * HOP_SAMPLES)
+static_assert(STREAM_BATCH_SAMPLES * sizeof(int16_t) == 2560, "80 ms PCM batch");
+
 #define DIGITAL_GAIN    16.0f
-#define VAD_THRESHOLD   2600 // Gate ambient noise w/ WiFi RF (~1800-2400 RMS), speech is ~6000-16000 RMS
+#define VAD_THRESHOLD   3800 // Gate ambient noise (~2500-3200 RMS w/ WiFi RF), speech is ~6000-35000 RMS
 #define DC_R            0.995f
 
 // --- PRE-ROLL BUFFER (200ms = 10 hops * 320 samples = 3,200 samples = 6.4KB) ---
 #define PREROLL_HOPS    10
 #define PREROLL_SAMPLES (PREROLL_HOPS * HOP_SAMPLES)
 int16_t preroll_buffer[PREROLL_SAMPLES];
+int16_t preroll_snapshot[PREROLL_SAMPLES];
 volatile int preroll_head = 0;
 
 // Streaming state
@@ -211,7 +222,7 @@ void compute_mfcc(int16_t* new_samples, int hop_size) {
         mfcc_matrix[c][NUM_FRAMES - 1] = current_frame_mfcc[c];
     }
     if (warmup_frames < WARMUP_REQUIRED) warmup_frames++;
-    new_frames_since_inference++;
+    if (new_frames_since_inference < 2) new_frames_since_inference++;
     portEXIT_CRITICAL(&matrix_mux);
 }
 
@@ -228,21 +239,23 @@ void audio_task(void* param) {
 
             float rms = 0;
             for (int i = 0; i < 320; i++) {
-                int32_t raw24 = raw32[i * 2];
-                int16_t s16 = (int16_t)(raw24 >> 14);
-                float x = (float)s16;
+                // INMP441 data is left-aligned in the 32-bit I2S slot.
+                // Keep the calibrated shift in a wide type: narrowing here wraps
+                // loud samples before the DC filter and saturation can run.
+                float x = (float)(raw32[i * 2] >> 14);
                 float y = x - dc_x1 + DC_R * dc_y1;
                 dc_x1 = x; dc_y1 = y;
 
                 float amplified = y * DIGITAL_GAIN;
-                rms += amplified * amplified;
 
                 if (amplified > 32767) amplified = 32767;
                 if (amplified < -32768) amplified = -32768;
                 pcm[i] = (int16_t)amplified;
+                rms += amplified * amplified;
             }
             latest_rms = sqrtf(rms / 320.0f);
 
+            portENTER_CRITICAL(&stream_mux);
             // Store in pre-roll circular buffer
             for (int i = 0; i < 320; i++) {
                 preroll_buffer[(preroll_head + i) % PREROLL_SAMPLES] = pcm[i];
@@ -254,6 +267,8 @@ void audio_task(void* param) {
                 xQueueSend(audio_stream_queue, pcm, 0);
             }
 
+            portEXIT_CRITICAL(&stream_mux);
+
             compute_mfcc(pcm, 320);
             core0_active_us += (micros() - t_c0);
         } else {
@@ -262,12 +277,24 @@ void audio_task(void* param) {
     }
 }
 
+// WiFiClient may accept fewer bytes than requested. Never skip the remainder.
+bool write_pcm(WiFiClient& client, const int16_t* pcm, size_t samples) {
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(pcm);
+    size_t remaining = samples * sizeof(int16_t);
+    while (remaining > 0 && client.connected()) {
+        size_t sent = client.write(data, remaining);
+        if (sent == 0) return false;
+        data += sent;
+        remaining -= sent;
+    }
+    return remaining == 0;
+}
+
 void stream_to_asr() {
     uint32_t t_wake = millis();
     Serial.printf("\n[STREAM] Triggering ASR Handoff to %s:%d ...\n", ASR_SERVER_IP, ASR_SERVER_PORT);
-
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[STREAM ERROR] Wi-Fi not connected!");
+    if (WiFi.status() != WL_CONNECTED || audio_stream_queue == nullptr) {
+        Serial.println("[STREAM ERROR] Wi-Fi or audio queue unavailable!");
         return;
     }
 
@@ -277,65 +304,69 @@ void stream_to_asr() {
         return;
     }
 
-    uint32_t t_connected = millis();
-    Serial.printf("[STREAM] TCP Connected in %d ms! Sending pre-roll buffer (%d ms)...\n",
-                  t_connected - t_wake, (PREROLL_SAMPLES * 1000) / SAMPLE_RATE);
+    Serial.printf("[STREAM] TCP connected in %lu ms. Sending 200 ms pre-roll.\n",
+                  (unsigned long)(millis() - t_wake));
 
-    // 1. Dump pre-roll buffer in chronological order
-    int head = preroll_head;
-    int16_t temp_buf[320];
-    for (int h = 0; h < PREROLL_HOPS; h++) {
-        int start_idx = (head + h * 320) % PREROLL_SAMPLES;
-        for (int i = 0; i < 320; i++) {
-            temp_buf[i] = preroll_buffer[(start_idx + i) % PREROLL_SAMPLES];
-        }
-        client.write((const uint8_t*)temp_buf, 320 * sizeof(int16_t));
-    }
-
-    if (audio_stream_queue != nullptr) {
-        xQueueReset(audio_stream_queue);
+    // Snapshot pre-roll and start queueing live audio at the same hop boundary.
+    // No network operations run while the capture task is locked.
+    xQueueReset(audio_stream_queue);
+    portENTER_CRITICAL(&stream_mux);
+    for (int i = 0; i < PREROLL_SAMPLES; i++) {
+        preroll_snapshot[i] = preroll_buffer[(preroll_head + i) % PREROLL_SAMPLES];
     }
     is_streaming = true;
+    portEXIT_CRITICAL(&stream_mux);
 
-    Serial.println("[STREAM] Pre-roll sent. Live streaming command audio...");
-
-    // 2. Stream live audio from queue until silence detected for >1.2s or max 5.0s
-    uint32_t stream_start = millis();
-    int silence_hops = 0;
-    int16_t live_pcm[320];
-
-    while (client.connected()) {
-        if (xQueueReceive(audio_stream_queue, live_pcm, pdMS_TO_TICKS(50)) == pdTRUE) {
-            client.write((const uint8_t*)live_pcm, 320 * sizeof(int16_t));
-
-            if (latest_rms < VAD_THRESHOLD) {
-                silence_hops++;
-            } else {
-                silence_hops = 0;
-            }
-
-            if (silence_hops >= 60 || (millis() - stream_start >= 5000)) {
-                Serial.printf("[STREAM] Speech finished (silence=%d hops, elapsed=%d ms). Closing stream.\n",
-                              silence_hops, millis() - stream_start);
-                break;
-            }
-        } else {
-            if (millis() - stream_start >= 5000) break;
+    bool write_ok = true;
+    for (int offset = 0; offset < PREROLL_SAMPLES; offset += STREAM_BATCH_SAMPLES) {
+        size_t count = min(STREAM_BATCH_SAMPLES, PREROLL_SAMPLES - offset);
+        if (!write_pcm(client, preroll_snapshot + offset, count)) {
+            write_ok = false;
+            break;
         }
     }
 
+    uint32_t stream_start = millis();
+    int silence_hops = 0;
+    int16_t batch[STREAM_BATCH_SAMPLES];
+    size_t batch_samples = 0;
+
+    // Four 20 ms hops per write: 12.5 writes/s instead of 50.
+    while (write_ok && client.connected() && millis() - stream_start < 5000) {
+        if (xQueueReceive(audio_stream_queue, batch + batch_samples, pdMS_TO_TICKS(50)) != pdTRUE) {
+            continue;
+        }
+        // Evaluate the queued hop itself, not a newer capture task RMS value.
+        float energy = 0.0f;
+        for (int i = 0; i < HOP_SAMPLES; i++) {
+            float sample = batch[batch_samples + i];
+            energy += sample * sample;
+        }
+        silence_hops = energy < (float)VAD_THRESHOLD * VAD_THRESHOLD * HOP_SAMPLES
+                           ? silence_hops + 1 : 0;
+        batch_samples += HOP_SAMPLES;
+        if (batch_samples == STREAM_BATCH_SAMPLES) {
+            write_ok = write_pcm(client, batch, batch_samples);
+            batch_samples = 0;
+        }
+        if (silence_hops >= 60) break;
+    }
+
+    portENTER_CRITICAL(&stream_mux);
     is_streaming = false;
-    client.flush();
+    portEXIT_CRITICAL(&stream_mux);
+    // Silence/timeout may end a command between batch boundaries.
+    if (write_ok && batch_samples > 0) {
+        write_ok = write_pcm(client, batch, batch_samples);
+    }
     client.stop();
-
-    uint32_t total_stream_duration = millis() - stream_start;
-    Serial.printf("[STREAM COMPLETE] Streamed %d ms of command audio to ASR server.\n\n",
-                  total_stream_duration);
-
+    Serial.printf("[STREAM %s] Command stream ended after %lu ms.\n",
+                  write_ok ? "COMPLETE" : "ERROR", (unsigned long)(millis() - stream_start));
     cooldown_until = millis() + 1000;
 }
 
 void setup() {
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
     Serial.setTxBufferSize(4096);
     Serial.setRxBufferSize(1024);
     Serial.begin(921600);
@@ -347,14 +378,20 @@ void setup() {
     // Initialize Wi-Fi in Station mode (connects in background without stalling audio)
     Serial.printf("Connecting to Wi-Fi SSID: %s ...\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(WIFI_PS_MIN_MODEM);
-    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    WiFi.setSleep(WIFI_PS_MAX_MODEM);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
+    if (!WiFi.setTxPower(WIFI_POWER_2dBm)) {
+        Serial.println("[Wi-Fi] Failed to set 2 dBm transmit power");
+    }
 
     setup_tflite();
     setup_i2s();
 
-    audio_stream_queue = xQueueCreate(20, 320 * sizeof(int16_t));
+    audio_stream_queue = xQueueCreate(20, HOP_SAMPLES * sizeof(int16_t));
+    if (audio_stream_queue == nullptr) {
+        Serial.println("Audio queue allocation failed!");
+        while (true) delay(1000);
+    }
 
     esp_err_t dsp_err = dsps_fft2r_init_fc32(NULL, N_FFT);
     if (dsp_err != ESP_OK) {
@@ -390,6 +427,8 @@ void loop() {
         Serial.println("[Wi-Fi] Disconnected, attempting reconnect...");
     }
 
+    // Application work only; these counters exclude Wi-Fi/RTOS/interrupt work.
+    // A 0% inference reading means VAD blocked ML, not that the core did no work.
     // Periodic CPU telemetry (reported every second)
     if (millis() - last_cpu_report_ms >= 1000) {
         uint32_t now = millis();
@@ -404,7 +443,7 @@ void loop() {
         if (cpu1 > 100.0f) cpu1 = 100.0f;
         float total_cpu = (cpu0 + cpu1) / 2.0f;
 
-        Serial.printf("[CPU REPORT] Core 0 (Audio): %.1f%% | Core 1 (ML/App): %.1f%% | Combined: %.1f%%\n",
+        Serial.printf("[TASK CPU REPORT] Core 0 (Audio): %.1f%% | Core 1 (Inference): %.1f%% | Combined: %.1f%%\n",
                       cpu0, cpu1, total_cpu);
     }
 
@@ -479,11 +518,11 @@ void loop() {
 
     // Wake word decision logic
     bool triggered = false;
-    if (prob >= 0.88f) {
+    if (prob >= 0.90f) {
         triggered = true;
-    } else if (prob >= 0.72f) {
+    } else if (prob >= 0.78f) {
         trigger_streak++;
-        if (trigger_streak >= 2) {
+        if (trigger_streak >= 3) {
             triggered = true;
         }
     } else {
